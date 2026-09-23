@@ -13,58 +13,25 @@ if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
     exit 1
 fi
 
-# AUDIO_URL is optional. When set, it's a background music track (or a
-# playlist of mp3 urls) that plays under the video.
-#   MUTE_VIDEO_AUDIO=false (default) -> video's own audio is mixed with
-#                                        the background track
-#   MUTE_VIDEO_AUDIO=true            -> video's own audio is silenced;
-#                                        only the background track plays
-MUTE_VIDEO_AUDIO="${MUTE_VIDEO_AUDIO:-false}"
-
 echo "========================================"
 echo "Starting 24/7 YouTube Stream (simple overlay)"
 echo "Output Resolution : 1280x720 (720p — sized for a 2-core CI runner)"
 echo "FPS               : 30"
-echo "Mute video audio  : ${MUTE_VIDEO_AUDIO}"
 echo "========================================"
 
 #############################################
 # Simple filter: scale/pad video to 1280x720,
 # scale overlay.png to match, composite it on top.
-# (aloop / amix stages are appended per-video in
-# run_video() when background audio is present.)
 #############################################
-BASE_FILTER="[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black[video];"
-BASE_FILTER+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
-BASE_FILTER+="[video][ovl]overlay=0:0[final]"
+FILTER="[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black[video];"
+FILTER+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
+FILTER+="[video][ovl]overlay=0:0[final]"
 
 #############################################
 # Auto-restart on failure
 #############################################
 MAX_RETRIES=5       # per-video retry attempts before moving on
 RETRY_DELAY=5        # seconds between retries
-
-#############################################
-# Parse AUDIO_URL into a playlist (same
-# comma/newline parsing as VIDEO_URL below).
-# Optional — if unset, no background track is
-# added and video audio passes through as-is
-# (unless MUTE_VIDEO_AUDIO=true, which silences
-# it and outputs silence instead).
-#############################################
-AUDIO_URLS=()
-if [ -n "${AUDIO_URL:-}" ]; then
-    while IFS= read -r a; do
-        a="${a#"${a%%[![:space:]]*}"}"
-        a="${a%"${a##*[![:space:]]}"}"
-        [ -n "$a" ] && AUDIO_URLS+=("$a")
-    done < <(printf '%s\n' "$AUDIO_URL" | tr '\r,' '\n\n')
-fi
-AUDIO_NUM=${#AUDIO_URLS[@]}
-if [ "$AUDIO_NUM" -gt 0 ]; then
-    echo "Loaded $AUDIO_NUM background audio track(s) from AUDIO_URL."
-fi
-AUDIO_IDX=0   # round-robins through AUDIO_URLS, one track per video, wrapping around (looping the playlist)
 
 #############################################
 # Stream one video with automatic retry on
@@ -74,62 +41,6 @@ AUDIO_IDX=0   # round-robins through AUDIO_URLS, one track per video, wrapping a
 run_video() {
     local url="$1"
     local attempt=1
-
-    #########################################
-    # Pick this video's background audio track
-    # (if any) and build the extra ffmpeg input
-    # / map / filter args for it. Input index 2
-    # is always the audio input, whenever one is
-    # present (either a real track or a
-    # synthesized silent one for the mute-with-
-    # no-AUDIO_URL case).
-    #
-    # NOTE: audio looping is done with the aloop
-    # *filter* (on the decoded stream), not
-    # -stream_loop on the input. -stream_loop is
-    # a demuxer-level flag, and combining it with
-    # -re on the video input broke real-time
-    # pacing (ffmpeg was blasting frames out at
-    # ~3.8x wall-clock speed instead of ~1x,
-    # which a live RTMP push can't tolerate).
-    # aloop loops the decoded audio buffer inside
-    # the filter graph instead, so it never
-    # touches input read-rate / -re at all.
-    #########################################
-    local filter="$BASE_FILTER"
-    local audio_input_args=()
-    local audio_map_args=()
-
-    if [ "$AUDIO_NUM" -gt 0 ]; then
-        local audio_url="${AUDIO_URLS[$((AUDIO_IDX % AUDIO_NUM))]}"
-        AUDIO_IDX=$((AUDIO_IDX + 1))
-        echo "Background audio: $audio_url"
-        audio_input_args=(-i "$audio_url")
-        # size is a sample-count ceiling, not a target — with any real
-        # mp3 (well under ~12 hours of samples at 48kHz) this just loops
-        # the whole track indefinitely.
-        filter+=";[2:a]aloop=loop=-1:size=2147483647[abg]"
-        if [ "$MUTE_VIDEO_AUDIO" = true ]; then
-            audio_map_args=(-map "[abg]")
-        else
-            # Mix the video's own audio with the background track.
-            # Assumes the video has an audio stream (0:a) — if a given
-            # video is silent, drop MUTE_VIDEO_AUDIO to true or this
-            # mix stage will fail on that clip.
-            filter+=";[0:a][abg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-            audio_map_args=(-map "[aout]")
-        fi
-    else
-        if [ "$MUTE_VIDEO_AUDIO" = true ]; then
-            # No AUDIO_URL given but muting was requested — output
-            # silence instead of the video's own audio. anullsrc is
-            # already an infinite generator, so no looping is needed.
-            audio_input_args=(-f lavfi -i "anullsrc=r=48000:cl=stereo")
-            audio_map_args=(-map 2:a)
-        else
-            audio_map_args=(-map 0:a?)
-        fi
-    fi
 
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         echo "----------------------------------------"
@@ -147,10 +58,9 @@ run_video() {
         -re \
         -i "$url" \
         -loop 1 -i overlay.png \
-        "${audio_input_args[@]}" \
-        -filter_complex "$filter" \
+        -filter_complex "$FILTER" \
         -map "[final]" \
-        "${audio_map_args[@]}" \
+        -map 0:a? \
         -r 30 \
         -s 1280x720 \
         -c:v libx264 \
